@@ -82,7 +82,7 @@ class RVC:
             self.f0_mel_max = 1127 * np.log(1 + self.f0_max / 700)
             self.is_half = config.is_half
             if index_rate != 0:
-                self.index = faiss.read_index(index_path)
+                self.index = faiss.deserialize_index(np.fromfile(index_path, dtype=np.uint8))
                 self.big_npy = self.index.reconstruct_n(0, self.index.ntotal)
                 printt(i18n("已启用索引检索"))
             self.pth_path = pth_path
@@ -140,7 +140,7 @@ class RVC:
 
     def change_index_rate(self, new_index_rate):
         if new_index_rate != 0 and self.index_rate == 0:
-            self.index = faiss.read_index(self.index_path)
+            self.index = faiss.deserialize_index(np.fromfile(self.index_path, dtype=np.uint8))
             self.big_npy = self.index.reconstruct_n(0, self.index.ntotal)
             printt(i18n("已启用索引检索"))
         self.index_rate = new_index_rate
@@ -158,11 +158,24 @@ class RVC:
         f0_coarse = torch.round(f0_mel).long()
         return f0_coarse, f0
 
-    def get_f0(self, x, f0_up_key, method="rmvpe"):
+    def get_f0(self, x, f0_up_key, method="rmvpe", filter_radius=1, preserve_unvoiced=False):
+        if not isinstance(filter_radius, int) or not 0 <= filter_radius <= 7:
+            raise ValueError("Harvest median filter radius must be an integer between 0 and 7")
+        if method == "harvest":
+            import pyworld
+            from scipy import signal
+            f0, _ = pyworld.harvest(x.cpu().numpy().astype(np.double), fs=16000,
+                f0_ceil=1100, f0_floor=50, frame_period=10)
+            if filter_radius > 0:
+                f0 = signal.medfilt(f0, 2 * filter_radius + 1)
+            f0 *= pow(2, f0_up_key / 12)
+            return self.get_f0_post(f0)
+        if method == "crepe":
+            return self.get_f0_crepe(x, f0_up_key)
         if method == "rmvpe":
-            return self.get_f0_rmvpe(x, f0_up_key)
+            return self.get_f0_rmvpe(x, f0_up_key, preserve_unvoiced)
         if method == "fcpe":
-            return self.get_f0_fcpe(x, f0_up_key)
+            return self.get_f0_fcpe(x, f0_up_key, preserve_unvoiced)
         if method != "pm":
             raise ValueError(f"Unsupported F0 method: {method}")
         x = x.cpu().numpy()
@@ -182,12 +195,37 @@ class RVC:
             f0 = np.pad(f0, (0, p_len - len(f0)))
         f0 = f0[:p_len]
         uv = f0 == 0
-        if np.any(~uv):
+        if not preserve_unvoiced and np.any(~uv):
             f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
         f0 *= pow(2, f0_up_key / 12)
         return self.get_f0_post(f0)
 
-    def get_f0_rmvpe(self, x, f0_up_key):
+    def get_f0_crepe(self, x, f0_up_key):
+        if "privateuseone" in str(
+            self.device
+        ):  ###不支持dml，cpu又太慢用不成，拿fcpe顶替
+            return self.get_f0(x, f0_up_key, "fcpe")
+        # printt("using crepe,device:%s"%self.device)
+        import torchcrepe
+        f0, pd = torchcrepe.predict(
+            x.unsqueeze(0).float(),
+            16000,
+            160,
+            self.f0_min,
+            self.f0_max,
+            "full",
+            batch_size=512,
+            # device=self.device if self.device.type!="privateuseone" else "cpu",###crepe不用半精度全部是全精度所以不愁###cpu延迟高到没法用
+            device=self.device,
+            return_periodicity=True,
+        )
+        pd = torchcrepe.filter.median(pd, 3)
+        f0 = torchcrepe.filter.mean(f0, 3)
+        f0[pd < 0.1] = 0
+        f0 *= pow(2, f0_up_key / 12)
+        return self.get_f0_post(f0)
+
+    def get_f0_rmvpe(self, x, f0_up_key, preserve_unvoiced=False):
         if hasattr(self, "model_rmvpe") == False:
             from infer.rmvpe import RMVPE
 
@@ -199,12 +237,12 @@ class RVC:
             )
         f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
         uv = f0 == 0
-        if np.any(~uv):
+        if not preserve_unvoiced and np.any(~uv):
             f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
         f0 *= pow(2, f0_up_key / 12)
         return self.get_f0_post(f0)
 
-    def get_f0_fcpe(self, x, f0_up_key):
+    def get_f0_fcpe(self, x, f0_up_key, preserve_unvoiced=False):
         if hasattr(self, "model_fcpe") == False:
             from infer.fcpe import FCPEInfer
 
@@ -217,7 +255,7 @@ class RVC:
             threshold=0.006,
         ).squeeze().detach().cpu().numpy()
         uv = f0 == 0
-        if np.any(~uv):
+        if not preserve_unvoiced and np.any(~uv):
             f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
         f0 *= pow(2, f0_up_key / 12)
         return self.get_f0_post(f0)
@@ -229,7 +267,13 @@ class RVC:
         skip_head,
         return_length,
         f0method,
+        protect=0.5,
+        speaker_id=0,
+        filter_radius=1,
     ) :
+        if not 0 <= protect <= 0.5:
+            raise ValueError("protect must be between 0 and 0.5")
+        protect_active = protect < 0.5 and self.if_f0 == 1 and self.index_rate != 0
         report_status = self.infer_count < 3 or self.infer_count % 100 == 0
         self.infer_count += 1
         t1 = ttime()
@@ -246,13 +290,14 @@ class RVC:
                 padding_mask=padding_mask,
             )
             feats = torch.cat((feats, feats[:, -1:, :]), 1)
+            original_feats = feats.clone() if protect_active else None
         t2 = ttime()
         try:
             if hasattr(self, "index") and self.index_rate != 0:
                 npy = feats[0][skip_head // 2 :].cpu().numpy().astype("float32")
                 score, ix = self.index.search(npy, k=8)
                 if (ix >= 0).all():
-                    weight = np.square(1 / score)
+                    weight = np.square(1 / score.clip(min=1e-12))
                     weight /= weight.sum(axis=1, keepdims=True)
                     npy = np.sum(
                         self.big_npy[ix] * np.expand_dims(weight, axis=2), axis=1
@@ -280,12 +325,14 @@ class RVC:
         return_length2 = int(np.ceil(return_length * factor))
         if self.if_f0 == 1:
             f0_extractor_frame = block_frame_16k + 800
+            if f0method == "harvest":
+                f0_extractor_frame = block_frame_16k + max(800, filter_radius * 320)
             if f0method == "rmvpe":
                 f0_extractor_frame = 5120 * ((f0_extractor_frame - 1) // 5120 + 1) - 160
             pitch, pitchf = self.get_f0(
                 input_wav[-f0_extractor_frame:],
                 self.f0_up_key - self.formant_shift,
-                f0method,
+                f0method, filter_radius, protect_active,
             )
             shift = block_frame_16k // 160
             self.cache_pitch[:-shift] = self.cache_pitch[shift:].clone()
@@ -297,8 +344,12 @@ class RVC:
         t4 = ttime()
         feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
         feats = feats[:, :p_len, :]
+        if original_feats is not None:
+            original_feats = F.interpolate(original_feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)[:, :p_len, :]
+            weight = torch.where(cache_pitchf >= 1, 1., protect).unsqueeze(-1).to(feats)
+            feats = feats * weight + original_feats * (1 - weight)
         p_len_tensor = torch.LongTensor([p_len]).to(self.device)
-        sid = torch.LongTensor([0]).to(self.device)
+        sid = torch.LongTensor([speaker_id]).to(self.device)
         skip_head_value = int(skip_head)
         return_length_value = int(return_length)
         return_length2_value = int(return_length2)

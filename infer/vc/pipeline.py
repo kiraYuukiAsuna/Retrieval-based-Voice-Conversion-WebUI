@@ -67,8 +67,10 @@ class Pipeline(object):
         p_len,
         f0_up_key,
         f0_method,
+        filter_radius=3,
+        preserve_unvoiced=False,
     ):
-        if f0_method not in ("pm", "rmvpe", "fcpe"):
+        if f0_method not in ("pm", "rmvpe", "fcpe", "harvest", "crepe"):
             raise ValueError(f"Unsupported F0 method: {f0_method}")
         time_step = self.window / self.sr * 1000
         f0_min = 50
@@ -91,6 +93,35 @@ class Pipeline(object):
                 f0 = np.pad(
                     f0, [[pad_size, p_len - len(f0) - pad_size]], mode="constant"
                 )
+        elif f0_method == "harvest":
+            import pyworld
+            f0, t = pyworld.harvest(x.astype(np.double), fs=self.sr,
+                f0_ceil=f0_max, f0_floor=f0_min, frame_period=10)
+            f0 = pyworld.stonemask(x.astype(np.double), f0, t, self.sr)
+            if filter_radius > 2:
+                f0 = signal.medfilt(f0, 3)
+        elif f0_method == "crepe":
+            import torchcrepe
+            model = "full"
+            # Pick a batch size that doesn't cause memory errors on your gpu
+            batch_size = 512
+            # Compute pitch using first gpu
+            audio = torch.tensor(np.copy(x))[None].float()
+            f0, pd = torchcrepe.predict(
+                audio,
+                self.sr,
+                self.window,
+                f0_min,
+                f0_max,
+                model,
+                batch_size=batch_size,
+                device=self.device,
+                return_periodicity=True,
+            )
+            pd = torchcrepe.filter.median(pd, 3)
+            f0 = torchcrepe.filter.mean(f0, 3)
+            f0[pd < 0.1] = 0
+            f0 = f0[0].cpu().numpy()
         elif f0_method == "rmvpe":
             if not hasattr(self, "model_rmvpe"):
                 from infer.rmvpe import RMVPE
@@ -122,11 +153,10 @@ class Pipeline(object):
                 threshold=0.006,
             ).squeeze().detach().cpu().numpy()
 
-        try:
+        if not preserve_unvoiced:
             uv = f0 == 0
-            f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
-        except Exception:
-            traceback.print_exc()
+            if np.any(~uv):
+                f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
         f0 *= pow(2, f0_up_key / 12)
         f0bak = f0.copy()
         f0_mel = 1127 * np.log(1 + f0 / 700)
@@ -184,7 +214,7 @@ class Pipeline(object):
                 npy = npy.astype("float32")
 
             score, ix = index.search(npy, k=8)
-            weight = np.square(1 / score)
+            weight = np.square(1 / score.clip(min=1e-12))
             weight /= weight.sum(axis=1, keepdims=True)
             npy = np.sum(index_vectors[ix] * np.expand_dims(weight, axis=2), axis=1)
 
@@ -269,6 +299,7 @@ class Pipeline(object):
         rms_mix_rate,
         version,
         protect,
+        filter_radius=3,
     ):
         if (
             file_index != ""
@@ -276,7 +307,7 @@ class Pipeline(object):
             and index_rate != 0
         ):
             try:
-                index = faiss.read_index(file_index)
+                index = faiss.deserialize_index(np.fromfile(file_index, dtype=np.uint8))
                 index_vectors = index.reconstruct_n(0, index.ntotal)
             except:
                 traceback.print_exc()
@@ -312,7 +343,7 @@ class Pipeline(object):
                 audio_pad,
                 p_len,
                 f0_up_key,
-                f0_method,
+                f0_method, filter_radius, protect < 0.5,
             )
             pitch = pitch[:p_len]
             pitchf = pitchf[:p_len]

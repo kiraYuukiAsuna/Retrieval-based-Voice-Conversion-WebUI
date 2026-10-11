@@ -230,3 +230,34 @@ python webui.py --noautoopen
 <a href="https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI/graphs/contributors" target="_blank">
   <img src="https://contrib.rocks/image?repo=RVC-Project/Retrieval-based-Voice-Conversion-WebUI" />
 </a>
+
+
+## MomiyaAI client runtime
+
+The client launches `Python3.10.11/python.exe -u Infer.py <runtime> <model.pth> <model.index>`.
+`Infer.py` implements model loading, audio processing and the persistent stdin/stdout
+request loop. The old HTTP worker interface is removed.
+Package `Infer.py`, `infer/vc/pipeline.py`, and
+`infer/rtrvc.py` together with the runtime and model dependencies. The new client
+requires this resource version; it no longer embeds or extracts a Python adapter.
+
+The pipe protocol is JSON lines, version 1, announced in the initial `ok` response.
+`stream` carries base64 float32 mono PCM at 48 kHz; `file` returns base64 PCM16 WAV.
+Diagnostics use stderr. Realtime protection and speaker selection are implemented in
+`RVC.infer`; FCPE file extraction is implemented in `Pipeline.get_f0`.
+Streaming options include `realtimeHarvestFilterRadius` (0 disables filtering;
+1–7 select a median window of 3–15 points, default 1). The file pipeline retains
+its separate fixed 3-point Harvest filter switch. Output DPDFNet processing is
+performed by the client after RVC, before playback and monitoring.
+
+Streaming `usePhaseVocoder` defaults to true in the client. Both modes first use
+SOLA alignment: true uses the original GUI phase-vocoder overlap synthesis; false
+uses ordinary crossfade. The option can change between blocks without resetting
+the model history. It does not affect file conversion.
+
+The MomiyaAI resource bundle uses the included Python3.10.11 runtime with
+Transformers 4.49.x and the upstream `assets/hubert_base` checkpoint. Keep
+PyTorch, torchaudio and torchvision on matching CPU/CUDA builds (the bundled
+CPU runtime uses 2.10.0 / 2.10.0 / 0.25.0). Client
+Harvest/CREPE controls are retained alongside the upstream pitch methods;
+unvoiced F0 is preserved when consonant protection is active.
