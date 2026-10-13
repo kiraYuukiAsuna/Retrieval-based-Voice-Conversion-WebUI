@@ -270,6 +270,7 @@ class RVC:
         protect=0.5,
         speaker_id=0,
         filter_radius=1,
+        right_padding_16k=0,
     ) :
         if not 0 <= protect <= 0.5:
             raise ValueError("protect must be between 0 and 0.5")
@@ -327,6 +328,9 @@ class RVC:
             f0_extractor_frame = block_frame_16k + 800
             if f0method == "harvest":
                 f0_extractor_frame = block_frame_16k + max(800, filter_radius * 320)
+            # Refresh the real block and artificial right context; advance the
+            # persistent pitch timeline only by the real block below.
+            f0_extractor_frame += right_padding_16k
             if f0method == "rmvpe":
                 f0_extractor_frame = 5120 * ((f0_extractor_frame - 1) // 5120 + 1) - 160
             pitch, pitchf = self.get_f0(

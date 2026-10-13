@@ -4,7 +4,7 @@ param(
     [string]$Version,
     [string]$OutputDirectory,
     [string]$Python,
-    [ValidateRange(0, 9)][int]$CompressionLevel = 1,
+    [ValidateRange(0, 9)][int]$CompressionLevel = 9,
     [switch]$Plan,
     [switch]$Force
 )

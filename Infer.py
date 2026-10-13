@@ -89,8 +89,12 @@ class RVCWorker:
             block = int(o["blockMilliseconds"]) * 48
             overlap = int(o["crossfadeMilliseconds"]) * 48
             extra = int(o["contextMilliseconds"]) * 48
+            padding_ms = int(o.get("rightPaddingMilliseconds", 80))
+            if not 0 <= padding_ms <= 300 or padding_ms % 10:
+                raise ValueError("推理尾部静音必须为 0～300 ms，步长 10 ms。")
+            padding = padding_ms * 48
             search = 480
-            key = (block, overlap, extra)
+            key = (block, overlap, extra, padding)
             if samples.size != block:
                 raise ValueError("音频分块大小不匹配。")
             if reset or state is None or state[0] != key:
@@ -103,14 +107,17 @@ class RVCWorker:
             _, history, tail, fade = state
             history[:-block] = history[block:].clone()
             history[-block:] = torch.from_numpy(samples.copy()).to(device)
-            wav16 = to16(history)
+            # Padding is temporary context, never part of the rolling input history.
+            wav16 = to16(F.pad(history, (0, padding)) if padding else history)
             with torch.no_grad():
                 converted = rvc.infer(wav16, block // 3, extra // 480,
-                    (block + overlap + search) // 480, o["f0Method"],
+                    (block + overlap + search + padding) // 480, o["f0Method"],
                     protect=float(o["protect"]), speaker_id=speaker,
-                    filter_radius=o["realtimeHarvestFilterRadius"])
+                    filter_radius=o["realtimeHarvestFilterRadius"], right_padding_16k=padding // 3)
                 if to48 is not None:
                     converted = to48(converted)
+                # Remove synthesized padding before envelope matching and SOLA.
+                converted = converted[:block + overlap + search]
                 # Envelope matching uses local 20 ms windows and preserves transitions.
                 mix = float(o["rmsMixRate"])
                 if mix < 1:
